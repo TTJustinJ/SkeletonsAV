@@ -18,3 +18,8 @@ Milestone, Target Date,	Description
 5. Full-Stack Simulation, **April 7**, Combine routing, motion planning, and localization.
 6. Testing & Debugging, **April 13**, Refine trajectory generation; ensure correct stops at stop signs/loading zones.
 7. Final Demo & Documentation, **April 17**, Complete final demonstration, produce project documentation, and wrap up.
+
+## Current Issue
+1. PKG added Interpolations, whether it is viable
+2. PID countrol not realized, but relied on the speed limit
+3. PKG added StaticsArray, whether it is viable
