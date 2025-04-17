@@ -1,137 +1,163 @@
-struct MyLocalizationType
-    field1::Int
-    field2::Float64
+
+# ---------------------------------------------------------------------------
+# State Types
+# ---------------------------------------------------------------------------
+# We now define an EKF state for localization.
+# The state vector is 13-dimensional:
+#   x[1:3]   : position (in map frame)
+#   x[4:7]   : orientation as quaternion [w, x, y, z]
+#   x[8:10]  : velocity (in body frame)
+#   x[11:13] : angular velocity (in body frame)
+struct EKFState
+    x::Vector{Float64}    # 13-element state vector
+    P::Matrix{Float64}    # 13x13 covariance matrix
 end
 
+# Dummy perception state remains simple.
 struct MyPerceptionType
     field1::Int
     field2::Float64
 end
 
-#Original dummy function
-"""
-function localize(gps_channel, imu_channel, localization_state_channel)
-    # Set up algorithm / initialize variables
-    while true
-        fresh_gps_meas = []
-        while isready(gps_channel)
-            meas = take!(gps_channel)
-            push!(fresh_gps_meas, meas)
-        end
-        fresh_imu_meas = []
-        while isready(imu_channel)
-            meas = take!(imu_channel)
-            push!(fresh_imu_meas, meas)
-        end
-        
-        # process measurements
+# ---------------------------------------------------------------------------
+# EKF and Process/Measurement Models
+# ---------------------------------------------------------------------------
+# We use the functions defined in measurements.jl:
+#   - f(x, Δt) and Jac_x_f(x, Δt): process model and its Jacobian.
+#   - h_gps(x) and Jac_h_gps(x): measurement model (for GPS) and its Jacobian.
+#
+# We define Q and R for our EKF:
+const Q_ekf = Diagonal(fill(0.01, 13))  # Process noise covariance (tune as needed)
+const R_ekf = Diagonal([0.5, 0.5, 0.1])   # GPS measurement noise covariance
 
-        localization_state = MyLocalizationType(0,0.0)
-        if isready(localization_state_channel)
-            take!(localization_state_channel)
-        end
-        put!(localization_state_channel, localization_state)
-    end 
+# Updated EKF update function.
+# It first propagates the state using available IMU measurements (by calling f)
+# and then, if a GPS measurement is available, applies an update step.
+function ekf_update(prev_ekf::EKFState, gps_meas::Vector{GPSMeasurement}, imu_meas::Vector{IMUMeasurement}, dt::Float64)
+    ekf = prev_ekf
+    # Process each IMU measurement by propagating the state.
+    # (In a full implementation, you’d incorporate the IMU values into the process model;
+    # here we simply call the provided rigid-body dynamics function f.)
+    for meas in imu_meas
+        # For simplicity, we use a fixed dt for each IMU update.
+        x_pred = f(ekf.x, dt)
+        A = Jac_x_f(ekf.x, dt)
+        P_pred = A * ekf.P * A' + Q_ekf
+        ekf = EKFState(x_pred, P_pred)
+    end
+
+    # If a GPS measurement is available, perform the update.
+    if !isempty(gps_meas)
+        # Use the most recent GPS measurement.
+        latest_gps = gps_meas[end]
+        # Convert the GPS measurement (lat, long, heading) into a measurement vector.
+        # Here we assume that lat and long are already expressed in map-frame coordinates.
+        z = [latest_gps.lat, latest_gps.long, latest_gps.heading]
+        z_pred = h_gps(ekf.x)
+        y = z - z_pred
+        H = Jac_h_gps(ekf.x)
+        S = H * ekf.P * H' + R_ekf
+        K = ekf.P * H' * inv(S)
+        x_new = ekf.x + K * y
+        P_new = (I - K * H) * ekf.P
+        ekf = EKFState(x_new, P_new)
+    end
+    return ekf
 end
-"""
 
-function localize(gps_channel, imu_channel, localization_state_channel)
-    # Wait for the first GPS measurement to initialize the state.
-    gps_meas = take!(gps_channel)
-    # Initialize state vector x ∈ ℝ¹³:
-    # x[1:3]   = position (we use lat, long, and set z = 0)
-    x = zeros(13)
-    x[1] = gps_meas.lat
-    x[2] = gps_meas.long
-    x[3] = 0.0
+# ---------------------------------------------------------------------------
+# Perception Update Function (Dummy)
+# ---------------------------------------------------------------------------
+# We update the perception state based on CameraMeasurement data.
+# In this dummy implementation we count the total number of bounding boxes
+# and combine that with the norm of the current estimated position.
+function perception_update(cam_meas, loc_state::EKFState)
+    count = 0
+    for meas in cam_meas
+        count += length(meas.bounding_boxes)
+    end
+    # Use the norm of the estimated position as an additional value.
+    pos_norm = norm(loc_state.x[1:3])
+    return MyPerceptionType(count, pos_norm)
+end
 
-    # For a planar vehicle, assume quaternion from yaw = heading:
-    # x[4:7]   = quaternion [w, x, y, z] from the GPS heading (assume pitch and roll are zero)
-    yaw = gps_meas.heading
-    x[4] = cos(yaw/2)   # w
-    x[5] = 0.0          # x
-    x[6] = 0.0          # y
-    x[7] = sin(yaw/2)   # z
-
-    # Initialize velocity and angular velocity to zero.
-    # x[8:10]  = velocity
-    # x[11:13] = angular velocity
-    x[8:10] .= 0.0
-    x[11:13] .= 0.0
-
-    # Initial covariance matrix for the state
-    P = Diagonal(fill(0.1, 13))
-
-    last_time = gps_meas.time
-
+# ---------------------------------------------------------------------------
+# Processing Functions
+# ---------------------------------------------------------------------------
+# Process ground-truth measurements (for debugging/cheating mode).
+function process_gt(gt_channel, shutdown_channel, localization_state_channel, perception_state_channel)
     while true
-        # Get the current system time (or use the next available measurement timestamp)
-        current_time = time()
-        dt = current_time - last_time
-        if dt <= 0
-            dt = 0.01  # ensure a small time step
+        fetch(shutdown_channel) && break
+
+        fresh_gt_meas = Measurement[]
+        while isready(gt_channel)
+            push!(fresh_gt_meas, take!(gt_channel))
         end
 
-        # Process all available IMU measurements
-        while isready(imu_channel)
-            imu_meas = take!(imu_channel)
-            dt_imu = imu_meas.time - last_time
-            dt = max(dt, dt_imu)
-            # EKF Prediction Step:
-            x = f(x, dt)
-            F = Jac_x_f(x, dt)
-            # Define process noise covariance Q (tune as necessary)
-            Q = Diagonal(fill(0.01, 13))
-            P = F * P * F' + Q
-            last_time = imu_meas.time
-        end
+        # In GT mode we “cheat” by setting a fixed state.
+        # For example, we set the EKF state to a predetermined value.
+        new_state = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        new_cov = Matrix{Float64}(I, 13, 13)
+        new_localization_state = EKFState(new_state, new_cov)
+        new_perception_state = MyPerceptionType(1, 1.0)
 
-        # Process a GPS measurement
-        if isready(gps_channel)
-            gps_meas = take!(gps_channel)
-            # Measurement vector: [lat, long, heading]
-            z = [gps_meas.lat, gps_meas.long, gps_meas.heading]
-            # Predicted measurement from current state:
-            z_pred = h_gps(x)
-            # Innovation:
-            y = z - z_pred
-            # Measurement Jacobian:
-            H = Jac_h_gps(x)
-            # Measurement noise covariance (tune these values)
-            R = Diagonal([1.0, 1.0, 0.1])
-            S = H * P * H' + R
-            K = P * H' * inv(S)
-            # EKF Correction Step:
-            x = x + K * y
-            P = (I(13) - K * H) * P
-            last_time = gps_meas.time
-        end
-
-        # Publish the localization state.
-        loc_state = MyLocalizationType(round(Int, x[1]), x[2])
         if isready(localization_state_channel)
             take!(localization_state_channel)
         end
-        put!(localization_state_channel, loc_state)
+        put!(localization_state_channel, new_localization_state)
 
-        sleep(0.001)
+        if isready(perception_state_channel)
+            take!(perception_state_channel)
+        end
+        put!(perception_state_channel, new_perception_state)
     end
 end
 
-function perception(cam_meas_channel, localization_state_channel, perception_state_channel)
-    # set up stuff
+# Localization function using the updated EKF.
+function localize(gps_channel, imu_channel, localization_state_channel, shutdown_channel)
+    # Initialize EKF state:
+    # Start at position (0,0,0), orientation as quaternion [1, 0, 0, 0],
+    # and zero velocity and angular velocity.
+    x0 = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    P0 = Matrix{Float64}(I, 13, 13)
+    ekf_state = EKFState(x0, P0)
+    dt = 0.1  # time step (seconds)
+
     while true
-        fresh_cam_meas = []
+        fetch(shutdown_channel) && break
+
+        fresh_gps_meas = GPSMeasurement[]
+        while isready(gps_channel)
+            push!(fresh_gps_meas, take!(gps_channel))
+        end
+
+        fresh_imu_meas = IMUMeasurement[]
+        while isready(imu_channel)
+            push!(fresh_imu_meas, take!(imu_channel))
+        end
+
+        ekf_state = ekf_update(ekf_state, fresh_gps_meas, fresh_imu_meas, dt)
+
+        if isready(localization_state_channel)
+            take!(localization_state_channel)
+        end
+        put!(localization_state_channel, ekf_state)
+    end 
+end
+
+# Perception processing: project camera measurements and update perception state.
+function perception(cam_meas_channel, localization_state_channel, perception_state_channel, shutdown_channel)
+    while true
+        fetch(shutdown_channel) && break
+
+        fresh_cam_meas = CameraMeasurement[]
         while isready(cam_meas_channel)
-            meas = take!(cam_meas_channel)
-            push!(fresh_cam_meas, meas)
+            push!(fresh_cam_meas, take!(cam_meas_channel))
         end
 
         latest_localization_state = fetch(localization_state_channel)
-        
-        # process bounding boxes / run ekf / do what you think is good
+        perception_state = perception_update(fresh_cam_meas, latest_localization_state)
 
-        perception_state = MyPerceptionType(0,0.0)
         if isready(perception_state_channel)
             take!(perception_state_channel)
         end
@@ -139,79 +165,145 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
     end
 end
 
-function decision_making(localization_state_channel, 
-        perception_state_channel, 
-        map, 
-        target_road_segment_id, 
-        socket)
-    # do some setup
+# Decision making: integrate localization and perception to compute control commands.
+# Here we compute a dummy steering angle based on the current position.
+function decision_making(localization_state_channel, perception_state_channel, target_segment_channel,
+                         shutdown_channel, map, socket)
     while true
-        latest_localization_state = fetch(localization_state_channel)
-        latest_perception_state = fetch(perception_state_channel)
+        fetch(shutdown_channel) && break
 
-        # figure out what to do ... setup motion planning problem etc
-        steering_angle = 0.0
-        target_vel = 0.0
+        latest_localization_state = fetch(localization_state_channel)  # EKFState
+        latest_perception_state = fetch(perception_state_channel)      # MyPerceptionType
+
+        # For demonstration, compute steering angle as the angle from current position
+        # toward a fixed target point from the map. (In a full system, route planning via Dijkstra would be used.)
+        # Here, we extract a dummy target point from the map (assume map is a Dict with keys "segment1", etc.)
+        # and use the localization state's position.
+        current_position = latest_localization_state.x[1:2]
+        # Assume the map contains a target point; if not, default to (0,0).
+        target_point = haskey(map, "target") ? map["target"] : SVector(10.0, 10.0)
+        dx = target_point[1] - current_position[1]
+        dy = target_point[2] - current_position[2]
+        steering_angle = atan(dy, dx)
+        # Dummy target velocity from the perception state.
+        target_vel = latest_perception_state.field2
+
         cmd = (steering_angle, target_vel, true)
         serialize(socket, cmd)
+        sleep(0.1)
     end
 end
 
+# Check if a channel is full.
 function isfull(ch::Channel)
     length(ch.data) ≥ ch.sz_max
 end
 
+# Dummy nonblocking key input.
+function get_c()
+    return ' '  # Replace with real nonblocking key input if needed.
+end
 
-function my_client(host::IPAddr=IPv4(0), port=4444)
+# ---------------------------------------------------------------------------
+# Client Setup and Shutdown
+# ---------------------------------------------------------------------------
+module VehicleSim
+export city_map
+function city_map()
+    # Use the city_map function from map.jl.
+    return city_map()
+end
+end
+
+function my_client(host::IPAddr=IPv4(0), port::Int=4444; use_gt=false)
     socket = Sockets.connect(host, port)
-    map_segments = VehicleSim.city_map()
+    map_segments = VehicleSim.city_map()  # Road network from map.jl
     
-    msg = deserialize(socket) # Visualization info
+    msg = deserialize(socket)  # Visualization info
     @info msg
 
+    # Create channels using the updated measurement types.
     gps_channel = Channel{GPSMeasurement}(32)
     imu_channel = Channel{IMUMeasurement}(32)
     cam_channel = Channel{CameraMeasurement}(32)
     gt_channel = Channel{GroundTruthMeasurement}(32)
 
-    #localization_state_channel = Channel{MyLocalizationType}(1)
-    #perception_state_channel = Channel{MyPerceptionType}(1)
+    # Use EKFState for localization.
+    localization_state_channel = Channel{EKFState}(1)
+    perception_state_channel = Channel{MyPerceptionType}(1)
+    target_segment_channel = Channel{Int}(1)
+    shutdown_channel = Channel{Bool}(1)
+    put!(shutdown_channel, false)
 
-    target_map_segment = 0 # (not a valid segment, will be overwritten by message)
-    ego_vehicle_id = 0 # (not a valid id, will be overwritten by message. This is used for discerning ground-truth messages)
+    target_map_segment = 0  # (will be overwritten by incoming messages)
+    ego_vehicle_id = 0      # (will be overwritten by incoming messages)
+    put!(target_segment_channel, target_map_segment)
 
-    errormonitor(@async while true
-        # This while loop reads to the end of the socket stream (makes sure you
-        # are looking at the latest messages)
-        sleep(0.001)
-        local measurement_msg
-        received = false
+    @async begin
+        # This task continuously reads from the socket and distributes measurements.
         while true
-            @async eof(socket)
-            if bytesavailable(socket) > 0
-                measurement_msg = deserialize(socket)
-                received = true
-            else
-                break
+            sleep(0.001)
+            local measurement_msg
+            received = false
+            while true
+                @async eof(socket)
+                if bytesavailable(socket) > 0
+                    measurement_msg = deserialize(socket)
+                    received = true
+                else
+                    break
+                end
             end
-        end
-        !received && continue
-        target_map_segment = measurement_msg.target_segment
-        ego_vehicle_id = measurement_msg.vehicle_id
-        for meas in measurement_msg.measurements
-            if meas isa GPSMeasurement
-                !isfull(gps_channel) && put!(gps_channel, meas)
-            elseif meas isa IMUMeasurement
-                !isfull(imu_channel) && put!(imu_channel, meas)
-            elseif meas isa CameraMeasurement
-                !isfull(cam_channel) && put!(cam_channel, meas)
-            elseif meas isa GroundTruthMeasurement
-                !isfull(gt_channel) && put!(gt_channel, meas)
-            end
-        end
-    end)
+            !received && continue
 
-    @async localize(gps_channel, imu_channel, localization_state_channel)
-    @async perception(cam_channel, localization_state_channel, perception_state_channel)
-    @async decision_making(localization_state_channel, perception_state_channel, map, socket)
+            target_map_segment = measurement_msg.target_segment
+            old_target_segment = fetch(target_segment_channel)
+            if target_map_segment ≠ old_target_segment
+                take!(target_segment_channel)
+                put!(target_segment_channel, target_map_segment)
+            end
+            ego_vehicle_id = measurement_msg.vehicle_id
+            for meas in measurement_msg.measurements
+                if meas isa GPSMeasurement
+                    !isfull(gps_channel) && put!(gps_channel, meas)
+                elseif meas isa IMUMeasurement
+                    !isfull(imu_channel) && put!(imu_channel, meas)
+                elseif meas isa CameraMeasurement
+                    !isfull(cam_channel) && put!(cam_channel, meas)
+                elseif meas isa GroundTruthMeasurement
+                    !isfull(gt_channel) && put!(gt_channel, meas)
+                end
+            end
+        end
+    end
+
+    if use_gt
+        @async process_gt(gt_channel, shutdown_channel, localization_state_channel, perception_state_channel)
+    else
+        @async localize(gps_channel, imu_channel, localization_state_channel, shutdown_channel)
+        @async perception(cam_channel, localization_state_channel, perception_state_channel, shutdown_channel)
+    end
+
+    @async decision_making(localization_state_channel, perception_state_channel, target_segment_channel,
+                           shutdown_channel, map_segments, socket)
+end
+
+function shutdown_listener(shutdown_channel)
+    info_string = """
+    ***************
+    CLIENT COMMANDS
+    ***************
+          - Make sure focus is on this terminal window.
+          - Press 'q' to shutdown threads.
+    """
+    @info info_string
+    while true
+        sleep(0.1)
+        key = get_c()
+        if key == 'q'
+            take!(shutdown_channel)
+            put!(shutdown_channel, true)
+            break
+        end
+    end
 end
