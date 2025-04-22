@@ -250,17 +250,30 @@ end
 has_stop_sign(seg::VehicleSim.RoadSegment) = any(t -> t == VehicleSim.RoadSegment.LaneTypes.stop_sign, seg.lane_types)
 
 
-function process_gt(gt_channel, shutdown_channel, target_segment_channel, perception_state_channel, road_map::Dict{Int,VehicleSim.RoadSegment}, socket)
-    # --- Initial Routing (hard-coded route) ---
+function process_gt(gt_channel, shutdown_channel, target_segment_channel, road_map::Dict{Int,VehicleSim.RoadSegment}, socket, ego_vehicle_id_channel)
+    # --- Initial Routing (hard‐coded route) ---
     while !isready(gt_channel)
         sleep(0.01)
     end
-    initial_gt = take!(gt_channel)
-    vehicle_pos = collect(initial_gt.position[1:2])
-    vehicle_heading = VehicleSim.extract_yaw_from_quaternion(collect(initial_gt.orientation))
 
+    while fetch(ego_vehicle_id_channel) == 0
+        sleep(0.01)
+    end
+    ego_vehicle_id = fetch(ego_vehicle_id_channel)
+    println("process_gt: ego_vehicle_id = $ego_vehicle_id")
+    ego_vehicle_id = fetch(ego_vehicle_id_channel)
+    while true
+        m = take!(gt_channel)
+        if m.vehicle_id == ego_vehicle_id
+            global vehicle_pos     = collect(m.position[1:2])
+            global vehicle_heading = VehicleSim.extract_yaw_from_quaternion(collect(m.orientation))
+            break
+        end
+    end
+
+    # get target and plan route
     target_seg_id = fetch(target_segment_channel)
-    start_seg_id = find_nearest_segment(vehicle_pos, road_map)
+    start_seg_id  = find_nearest_segment(vehicle_pos, road_map)
     route = SkeletonsAVStack.Routing.compute_route(road_map, start_seg_id, target_seg_id)
     if isempty(route)
         println("No valid route found from segment $start_seg_id to $target_seg_id. Aborting route execution.")
@@ -268,12 +281,15 @@ function process_gt(gt_channel, shutdown_channel, target_segment_channel, percep
     end
     println("Computed route: ", route)
 
-
-    println("segment 14", road_map[14])
     current_index = 1
+    default_speed   = 5.0
+    threshold       = 7.0   # segment‐end transition
+    stop_dist       = 20.0  # frontal blocking distance
+    clear_dist      = 15.0  # beyond which we consider the obstacle gone
+    lateral_thresh  = 2.0   # half‐width of blocking “lane”
 
-    default_speed = 8.5
-    threshold = 7.0  # distance threshold for segment transitions
+    # buffer for latest GT of every vehicle
+    latest_gt = Dict{Int,GroundTruthMeasurement}()
 
     # --- Main Loop: Follow the Precomputed Route ---
     while true
@@ -281,79 +297,160 @@ function process_gt(gt_channel, shutdown_channel, target_segment_channel, percep
         if isready(shutdown_channel) && fetch(shutdown_channel)
             break
         end
-
-        # Get latest GT
-        while !isready(gt_channel)
-            sleep(0.001)
+        # 1) drain gt_channel into buffer
+        while isready(gt_channel)
+            m = take!(gt_channel)
+            latest_gt[m.vehicle_id] = m
         end
-        latest_gt = take!(gt_channel)
-        vehicle_pos = collect(latest_gt.position[1:2])
-        vehicle_heading = VehicleSim.extract_yaw_from_quaternion(collect(latest_gt.orientation))
+        # 1) Make sure we’ve got a valid ego ID (non‑zero)
+        if ego_vehicle_id == 0
+            @warn "process_gt: still waiting on a real ego_vehicle_id…"
+            sleep(0.01)
+            continue
+        end
 
-        # Current segment
+        # 2) Wait until latest_gt actually contains our vehicle’s measurement
+        if !haskey(latest_gt, ego_vehicle_id)
+            @warn "process_gt: no ground‐truth for ego ID=$ego_vehicle_id yet, retrying…"
+            sleep(0.005)
+            continue
+        end
+
+        # 3) Now it’s safe to extract
+        self_meas   = latest_gt[ego_vehicle_id]
+        vehicle_pos = collect(self_meas.position[1:2])
+        vehicle_heading = VehicleSim.extract_yaw_from_quaternion(collect(self_meas.orientation))
+
+        # if isready(target_segment_channel)
+        #     new_target = take!(target_segment_channel)
+        #     put!(target_segment_channel, new_target)      # restore it so future loops still see it
+        
+        #     if new_target != target_seg_id
+        #         println("New target $new_target received — replanning…")
+        #         target_seg_id = new_target
+        
+        #         # replan from wherever we are now
+        #         start_seg_id = find_nearest_segment(vehicle_pos, road_map)
+        #         route = SkeletonsAVStack.Routing.compute_route(road_map, start_seg_id, target_seg_id)
+        
+        #         if isempty(route)
+        #             println(" No valid route to new target $target_seg_id — aborting.")
+        #             return
+        #         end
+        
+        #         println("Recomputed route: ", route)
+        #         current_index = 1
+        #     end
+        # end
+        
+            # --- Vehicle‑Ahead Check (2D bbox) ---
+        B = 0.5                              # safety buffer [m]
+        # inflate your corridor by that buffer
+        eff_lateral = lateral_thresh + B
+        eff_forward = stop_dist     + B
+
+        blocked = false
+        # approximate each car as a circle of radius R, plus a safety buffer B
+        R = 1.0            # ≈ half the width of your vehicle [m]
+        B = 0.5            # extra margin [m]
+        blocked = false
+        for (vid, meas) in latest_gt
+            vid == ego_vehicle_id && continue
+            # 1) compute other‑vehicle center in ego frame
+            dx, dy = meas.position[1] - vehicle_pos[1], meas.position[2] - vehicle_pos[2]
+            rel_x =  cos(vehicle_heading)*dx + sin(vehicle_heading)*dy
+            rel_y = -sin(vehicle_heading)*dx + cos(vehicle_heading)*dy
+
+            # 2) inflate front‐detection corridor by R+B
+            eff_lateral = lateral_thresh + R + B
+            eff_forward = stop_dist      + R + B
+
+            # 3) check: any part of that circle sits inside your stopping corridor?
+            if rel_x > 0 && abs(rel_y) < eff_lateral && rel_x < eff_forward
+                blocked = true
+                break
+            end
+        end
+
+        if blocked
+            serialize(socket, (0.0, 0.0, true))
+            continue
+        end
+
+
+        # 3) segment‐following logic
         current_seg_id = route[current_index]
-        current_seg = road_map[current_seg_id]
-        # println("current segment id: ", current_seg_id)
+        current_seg    = road_map[current_seg_id]
+
         if current_index < length(route)
-            # Steering toward lookahead point
+            # steering toward look‐ahead point
             lb1_end = collect(current_seg.lane_boundaries[1].pt_b)[1:2]
             lb2_end = collect(current_seg.lane_boundaries[2].pt_b)[1:2]
-            lookahead_point = 0.5 .* (lb1_end .+ lb2_end)
-            # println("lookahead point: ", lookahead_point)
-            desired_heading = atan(lookahead_point[2] - vehicle_pos[2], lookahead_point[1] - vehicle_pos[1])
-            steering_angle = angle_diff(desired_heading, vehicle_heading)
-            steering_angle = clamp(steering_angle, -1, 1)
-            # println("steering_angle, ", steering_angle)
-            cmd = (steering_angle, default_speed, true)
-            serialize(socket, cmd)
-            # --- Normal segment: use endpoint distance check ---
-            dist_to_end = segment_end_distance(current_seg, vehicle_pos)
-            if 5 < dist_to_end < 13 
-                if current_seg.lane_types[1] == VehicleSim.stop_sign
-                    println("STOP!!!!!!!!!!!!")
-                    cmd = (0, 0, true)
-                    serialize(socket, cmd)
-                    sleep(3.0)
-                    current_index +=1
-                    cmd = (0, 7.0, true)
-                    serialize(socket, cmd)
-                    continue
-                end
-            end
-            if dist_to_end < threshold
-                # println("Reached end of segment ", current_seg_id, " (dist=", dist_to_end, ").")
+            lookahead = 0.5 .* (lb1_end .+ lb2_end)
+            desired_heading = atan(lookahead[2] - vehicle_pos[2], lookahead[1] - vehicle_pos[1])
+            steering = clamp(angle_diff(desired_heading, vehicle_heading), -1, 1)
+            serialize(socket, (steering, default_speed, true))
+
+            # check for stop signs
+            dist_end = segment_end_distance(current_seg, vehicle_pos)
+            if 5 < dist_end < 13 && current_seg.lane_types[1] == VehicleSim.stop_sign
+                println("STOP at stop sign")
+                serialize(socket, (0.0, 0.0, true)); sleep(3.0)
                 current_index += 1
-                # println("Advancing to segment ", route[current_index])
-             
+                serialize(socket, (0.0, 7.0, true))
                 continue
             end
+
+            # advance segment
+            if dist_end < threshold
+                current_index += 1
+                continue
+            end
+
         else
-            if current_index == length(route)
-                # Last segment -> parking mode
-                A = collect(current_seg.lane_boundaries[2].pt_a)[1:2]
-                B = collect(current_seg.lane_boundaries[2].pt_b)[1:2]
-                C = collect(current_seg.lane_boundaries[3].pt_a)[1:2]
-                D = collect(current_seg.lane_boundaries[3].pt_b)[1:2]
-                center = 0.25 .* (A .+ B .+ C .+ D)
-                dist_to_center = norm(vehicle_pos - center)
-                if dist_to_center < 0.5
-                    println("At center of loading zone. Stopping vehicle.")
-                    cmd = (0.0, 0.0, true)
-                    serialize(socket, cmd)
-                    break
-                else
-                    # Move toward center
-                    desired_heading = atan(center[2] - vehicle_pos[2], center[1] - vehicle_pos[1])
-                    steering_angle = angle_diff(desired_heading, vehicle_heading)
-                    target_vel = default_speed * min(1.0, dist_to_center / 5.0)
-                    cmd = (steering_angle, target_vel, true)
-                    serialize(socket, cmd)
-                    continue
+            # last segment → parking mode
+            A = collect(current_seg.lane_boundaries[2].pt_a)[1:2]
+            B = collect(current_seg.lane_boundaries[2].pt_b)[1:2]
+            C = collect(current_seg.lane_boundaries[3].pt_a)[1:2]
+            D = collect(current_seg.lane_boundaries[3].pt_b)[1:2]
+            center = 0.25 .* (A .+ B .+ C .+ D)
+            d2c = norm(vehicle_pos - center)
+            if d2c < 4
+                println("Parking complete — waiting for new target…")
+                serialize(socket, (0.0, 0.0, true))
+        
+                # wait here until target_segment_channel gives us a genuinely new goal
+                while true
+                    if isready(target_segment_channel)
+                        new_t = take!(target_segment_channel)
+                        put!(target_segment_channel, new_t)
+                        if new_t != target_seg_id
+                            println(" Got new target $new_t — replanning route")
+                            start_seg_id = target_seg_id
+                            target_seg_id = new_t
+                            route = SkeletonsAVStack.Routing.compute_route(road_map, start_seg_id, target_seg_id)
+                            current_index = 1
+                            println("New route: ", route)
+                            break    # exit this wait‐loop and resume driving
+                        end
+                    end
+                    sleep(0.1)
                 end
+                # println("At loading‐zone center. Stopping.")
+                # serialize(socket, (0.0, 0.0, true))
+                # break
+            else
+                # drive into center
+                desired_heading = atan(center[2] - vehicle_pos[2], center[1] - vehicle_pos[1])
+                steering = angle_diff(desired_heading, vehicle_heading)
+                speed = default_speed * min(1.0, d2c/5.0)
+                serialize(socket, (steering, speed, true))
+                continue
             end
         end
     end
 end
+
 
 
 
@@ -569,64 +666,158 @@ end
 #     end
 # end
 
+# function localize(gps_channel, imu_channel, localization_state_channel, shutdown_channel)
+#     # --- Initialization: Wait for the first GPS measurement ---
+#     println("Waiting for initial GPS measurement for EKF initialization...")
+#     while !isready(gps_channel)
+#         if isready(shutdown_channel) && fetch(shutdown_channel)
+#             return  # Exit early if shutdown is signalled.
+#         end
+#         sleep(0.01)
+#     end
+#     initial_gps = take!(gps_channel)
+#     println("Initial GPS measurement: ", initial_gps)
+    
+#     # Use a chosen segment (say, segment 1) from the city map to establish the map’s coordinate frame.
+#     chosen_seg = 1
+#     init_config = VehicleSim.get_initialization_point(VehicleSim.city_map()[chosen_seg])
+#     map_origin = init_config.position  # An SVector{3} of (x,y,z) in meters.
+#     println("Map initialization position from chosen segment: ", map_origin)
+    
+#     # Compute the offset between the map's expected origin and the raw GPS measurement.
+#     # (Assume raw GPS measurement fields, though named lat/long, are expressed in meters in a different frame.)
+#     raw_gps_pos = [initial_gps.lat, initial_gps.long, 0.0]
+#     offset = map_origin - raw_gps_pos
+#     println("Computed offset between map origin and raw GPS: ", offset)
+    
+#     # Initialize the 13-dimensional state vector.
+#     x0 = zeros(13)
+#     # Set the initial position to the map origin.
+#     x0[1] = map_origin[1]
+#     x0[2] = map_origin[2]
+#     x0[3] = map_origin[3]
+    
+#     println("Initialized state position (x,y): ", x0[1:2])
+    
+#     # Initialize orientation as identity quaternion (or use init_config.yaw if available).
+#     x0[4] = 1.0; x0[5:7] .= 0.0
+#     # Initialize velocities to zero.
+#     x0[8:13] .= 0.0
+#     P0 = 0.1 * Matrix(1.0I, 13, 13)
+    
+#     # Create initial EKF states.
+#     ekf_gps = SkeletonsAVStack.Localization.EKFState(x0, P0)
+#     ekf_imu = SkeletonsAVStack.Localization.EKFState(x0, P0)
+    
+#     # Fuse the two branches and publish the initial state.
+#     fused_state = SkeletonsAVStack.Localization.fuse_states(ekf_gps, ekf_imu)
+#     put!(localization_state_channel, fused_state.x)
+#     println("Initial fused state: ", fused_state.x)
+    
+#     t_last = time()
+    
+#     # Main loop: update continuously.
+#     while true
+#         if isready(shutdown_channel) && fetch(shutdown_channel)
+#             println("Shutdown signal received. Exiting localization loop.")
+#             break
+#         end
+
+#         # Collect fresh GPS and IMU measurements.
+#         fresh_gps_meas = []
+#         while isready(gps_channel)
+#             push!(fresh_gps_meas, take!(gps_channel))
+#         end
+#         fresh_imu_meas = []
+#         while isready(imu_channel)
+#             push!(fresh_imu_meas, take!(imu_channel))
+#         end
+        
+#         dt = time() - t_last
+#         t_last = time()
+        
+#         # Prediction step for both EKF branches.
+#         ekf_gps = SkeletonsAVStack.Localization.ekf_predict(ekf_gps, dt)
+#         ekf_imu = SkeletonsAVStack.Localization.ekf_predict(ekf_imu, dt)
+        
+#         # Process all fresh GPS measurements.
+#         # Apply the previously computed offset to translate raw GPS reading into the map frame.
+#         for gps in fresh_gps_meas
+#             raw_pos = [gps.lat, gps.long, 0.0]
+#             corrected_pos = raw_pos + offset   # now in map coordinates.
+#             z_gps = [corrected_pos[1], corrected_pos[2], gps.heading]
+#             R_gps = Diagonal([1.0, 1.0, 0.1])
+#             ekf_gps = SkeletonsAVStack.Localization.ekf_update_gps(ekf_gps, z_gps, R_gps)
+#         end
+        
+#         # Process all fresh IMU measurements (unchanged).
+#         for imu in fresh_imu_meas
+#             z_imu = vcat(Vector(imu.linear_vel), Vector(imu.angular_vel))
+#             R_imu = Diagonal([0.001, 0.001, 0.001, 0.001, 0.001, 0.001])
+#             ekf_imu = SkeletonsAVStack.Localization.ekf_update_imu(ekf_imu, z_imu, R_imu)
+#         end
+        
+#         # Fuse the two branches.
+#         fused = SkeletonsAVStack.Localization.fuse_states(ekf_gps, ekf_imu)
+#         if !isempty(localization_state_channel)
+#             take!(localization_state_channel)
+#         end
+#         put!(localization_state_channel, fused.x)
+#         sleep(0.01)
+#     end
+# end
+
 function localize(gps_channel, imu_channel, localization_state_channel, shutdown_channel)
     # --- Initialization: Wait for the first GPS measurement ---
     println("Waiting for initial GPS measurement for EKF initialization...")
     while !isready(gps_channel)
         if isready(shutdown_channel) && fetch(shutdown_channel)
-            return  # Exit early if shutdown is signalled.
+            return  # Exit early if shutdown is signalled
         end
         sleep(0.01)
     end
     initial_gps = take!(gps_channel)
     println("Initial GPS measurement: ", initial_gps)
     
-    # Use a chosen segment (say, segment 1) from the city map to establish the map’s coordinate frame.
-    chosen_seg = 1
-    init_config = VehicleSim.get_initialization_point(VehicleSim.city_map()[chosen_seg])
-    map_origin = init_config.position  # An SVector{3} of (x,y,z) in meters.
-    println("Map initialization position from chosen segment: ", map_origin)
-    
-    # Compute the offset between the map's expected origin and the raw GPS measurement.
-    # (Assume raw GPS measurement fields, though named lat/long, are expressed in meters in a different frame.)
-    raw_gps_pos = [initial_gps.lat, initial_gps.long, 0.0]
-    offset = map_origin - raw_gps_pos
-    println("Computed offset between map origin and raw GPS: ", offset)
-    
-    # Initialize the 13-dimensional state vector.
+    # Initialize state vector (13-dimensional)
     x0 = zeros(13)
-    # Set the initial position to the map origin.
-    x0[1] = map_origin[1]
-    x0[2] = map_origin[2]
-    x0[3] = map_origin[3]
+    # Use raw GPS coordinates directly
+    x0[1] = initial_gps.lat   # Latitude as x position
+    x0[2] = initial_gps.long  # Longitude as y position
+    x0[3] = 0.0               # Altitude (z position)
     
-    println("Initialized state position (x,y): ", x0[1:2])
+    # Initialize orientation based on GPS heading
+    # Convert heading to quaternion (assuming heading is in radians)
+    x0[4] = cos(initial_gps.heading/2)  # Quaternion w component
+    x0[5] = 0.0                         # Quaternion x component
+    x0[6] = 0.0                         # Quaternion y component
+    x0[7] = sin(initial_gps.heading/2)  # Quaternion z component
     
-    # Initialize orientation as identity quaternion (or use init_config.yaw if available).
-    x0[4] = 1.0; x0[5:7] .= 0.0
-    # Initialize velocities to zero.
+    # Initialize velocities to zero
     x0[8:13] .= 0.0
+    
+    # Initial covariance
     P0 = 0.1 * Matrix(1.0I, 13, 13)
     
-    # Create initial EKF states.
+    # Create initial EKF states
     ekf_gps = SkeletonsAVStack.Localization.EKFState(x0, P0)
     ekf_imu = SkeletonsAVStack.Localization.EKFState(x0, P0)
     
-    # Fuse the two branches and publish the initial state.
+    # Fuse the two branches and publish the initial state
     fused_state = SkeletonsAVStack.Localization.fuse_states(ekf_gps, ekf_imu)
     put!(localization_state_channel, fused_state.x)
     println("Initial fused state: ", fused_state.x)
     
     t_last = time()
     
-    # Main loop: update continuously.
+    # Main loop: update continuously
     while true
         if isready(shutdown_channel) && fetch(shutdown_channel)
             println("Shutdown signal received. Exiting localization loop.")
             break
         end
 
-        # Collect fresh GPS and IMU measurements.
+        # Collect fresh GPS and IMU measurements
         fresh_gps_meas = []
         while isready(gps_channel)
             push!(fresh_gps_meas, take!(gps_channel))
@@ -639,34 +830,36 @@ function localize(gps_channel, imu_channel, localization_state_channel, shutdown
         dt = time() - t_last
         t_last = time()
         
-        # Prediction step for both EKF branches.
+        # Prediction step for both EKF branches
         ekf_gps = SkeletonsAVStack.Localization.ekf_predict(ekf_gps, dt)
         ekf_imu = SkeletonsAVStack.Localization.ekf_predict(ekf_imu, dt)
         
-        # Process all fresh GPS measurements.
-        # Apply the previously computed offset to translate raw GPS reading into the map frame.
+        # Process all fresh GPS measurements
         for gps in fresh_gps_meas
-            raw_pos = [gps.lat, gps.long, 0.0]
-            corrected_pos = raw_pos + offset   # now in map coordinates.
-            z_gps = [corrected_pos[1], corrected_pos[2], gps.heading]
-            R_gps = Diagonal([1.0, 1.0, 0.1])
+            # Use raw GPS coordinates directly
+            z_gps = [gps.lat, gps.long, gps.heading]
+            # Measurement noise - adjust these values based on your GPS accuracy
+            R_gps = Diagonal([1.0, 1.0, 1.0])  # [position variance, position variance, heading variance]
             ekf_gps = SkeletonsAVStack.Localization.ekf_update_gps(ekf_gps, z_gps, R_gps)
         end
         
-        # Process all fresh IMU measurements (unchanged).
+        # Process all fresh IMU measurements
         for imu in fresh_imu_meas
             z_imu = vcat(Vector(imu.linear_vel), Vector(imu.angular_vel))
             R_imu = Diagonal([0.001, 0.001, 0.001, 0.001, 0.001, 0.001])
             ekf_imu = SkeletonsAVStack.Localization.ekf_update_imu(ekf_imu, z_imu, R_imu)
         end
         
-        # Fuse the two branches.
+        # Fuse the two branches
         fused = SkeletonsAVStack.Localization.fuse_states(ekf_gps, ekf_imu)
+        
+        # Publish the new state
         if !isempty(localization_state_channel)
             take!(localization_state_channel)
         end
         put!(localization_state_channel, fused.x)
-        sleep(0.01)
+        
+        sleep(0.01)  # Adjust loop rate as needed
     end
 end
 
@@ -674,47 +867,47 @@ end
 
 
 
-function perception(cam_meas_channel, perception_state_channel, shutdown_channel)
-    while true
-        if isready(shutdown_channel) && fetch(shutdown_channel)
-            break
-        end
+# function perception(cam_meas_channel, perception_state_channel, shutdown_channel)
+#     while true
+#         if isready(shutdown_channel) && fetch(shutdown_channel)
+#             break
+#         end
         
-        # Collect all fresh camera measurements.
-        fresh_cam_meas = []
-        while isready(cam_meas_channel)
-            push!(fresh_cam_meas, take!(cam_meas_channel))
-        end
+#         # Collect all fresh camera measurements.
+#         fresh_cam_meas = []
+#         while isready(cam_meas_channel)
+#             push!(fresh_cam_meas, take!(cam_meas_channel))
+#         end
+#         # Process each camera measurement.
+#         all_tracked = Perception.TrackedObject[]
+#         println(cam_meas_channel[1].)
+#         for cam_meas in fresh_cam_meas
+#             tracked_objects = Perception.process_camera_measurement(cam_meas)
+#             append!(all_tracked, tracked_objects)
+#         end
+#         # In a full system, you might run a tracking filter for each detected object
+#         # to compute velocities and associate detections over time. Here, we simply pass the detections.
+#         perception_state = all_tracked
         
-        # Process each camera measurement.
-        all_tracked = Perception.TrackedObject[]
-        for cam_meas in fresh_cam_meas
-            tracked_objects = Perception.process_camera_measurement(cam_meas)
-            append!(all_tracked, tracked_objects)
-        end
-        # In a full system, you might run a tracking filter for each detected object
-        # to compute velocities and associate detections over time. Here, we simply pass the detections.
-        perception_state = all_tracked
+#         # Publish the new perception state.
+#         if !isempty(perception_state_channel)
+#             take!(perception_state_channel)
+#         end
+#         put!(perception_state_channel, perception_state)
         
-        # Publish the new perception state.
-        if !isempty(perception_state_channel)
-            take!(perception_state_channel)
-        end
-        put!(perception_state_channel, perception_state)
+#         # For debugging, print each tracked object.
+#         if !isempty(perception_state)
+#             println("Perception: Published tracked objects:")
+#             for obj in perception_state
+#                 println("  Object $(obj.id) in camera frame: Position = $(obj.position), BBox = $(obj.bbox)")
+#             end
+#         else
+#             println("Perception: No objects detected.")
+#         end
         
-        # For debugging, print each tracked object.
-        # if !isempty(perception_state)
-        #     println("Perception: Published tracked objects:")
-        #     for obj in perception_state
-        #         println("  Object $(obj.id) in camera frame: Position = $(obj.position), BBox = $(obj.bbox)")
-        #     end
-        # else
-        #     println("Perception: No objects detected.")
-        # end
-        
-        sleep(0.05)  # Adjust loop rate as needed.
-    end
-end
+#         sleep(0.05)  # Adjust loop rate as needed.
+#     end
+# end
 
 function find_nearest_segment(vehicle_pos::Vector{Float64}, map::Dict{Int, VehicleSim.RoadSegment})
     min_dist = Inf
@@ -844,111 +1037,455 @@ end
 
 
 # Revised decision-making function that computes the route once.
+# function decision_making(localization_state_channel, perception_state_channel, 
+#                          target_segment_channel, shutdown_channel, 
+#                          road_map::Dict{Int,VehicleSim.RoadSegment}, socket)
+#     # --- Initial Routing (compute once) ---
+#     # Wait a short time to get an initial state measurement.
+#     while !isready(localization_state_channel)
+#         sleep(0.01)
+#     end
+#     initial_state = take!(localization_state_channel)
+#     vehicle_pos = initial_state[1:2]
+#     vehicle_heading = VehicleSim.extract_yaw_from_quaternion(initial_state[4:7])
+    
+#     # Get the target segment from its channel.
+#     target_seg_id = fetch(target_segment_channel)
+#     # Find the starting segment (for example, using your find_nearest_segment helper).
+#     start_seg_id = find_nearest_segment(vehicle_pos, road_map)
+    
+#     # Compute the route once from the starting segment to the target.
+#     route = SkeletonsAVStack.Routing.compute_route(road_map, start_seg_id, target_seg_id)
+#     if isempty(route)
+#         println("No valid route found from segment $start_seg_id to $target_seg_id. Aborting route execution.")
+#         return
+#     end
+#     println("Computed route: ", route)
+#     # Set index to the current active segment in the route.
+#     current_index = 1
+
+#     # --- Main Loop: Follow the Precomputed Route ---
+#     while true
+#         if isready(shutdown_channel) && fetch(shutdown_channel)
+#             break
+#         end
+
+#         # Get the latest localization state.
+#         while !isready(localization_state_channel)
+#             sleep(0.001)
+#         end
+#         latest_loc = take!(localization_state_channel)
+#         vehicle_pos = latest_loc[1:2]
+#         vehicle_heading = VehicleSim.extract_yaw_from_quaternion(latest_loc[4:7])
+#         # Determine the current segment from the precomputed route.
+#         current_seg_id = route[current_index]
+#         current_seg = road_map[current_seg_id]
+#         # Check if the vehicle has reached the target of this segment.
+#         # (Assumes your reached_target(pos, vel, seg) function returns true if the vehicle is
+#         #  within a pre-defined threshold of the segment’s end.)
+#         seg_id = find_nearest_segment(vehicle_pos, road_map)
+#         if  seg_id !== nothing
+#             println("Segment $seg_id reached.")
+#             # If there is a next segment, advance the route index.
+#             if  seg_id == route[current_index+1]
+#                 current_index += 1
+#                 current_seg_id = route[current_index]
+#                 current_seg = road_map[current_seg_id]
+#             elseif current_index == length(route)
+#                 # Reached the end of the route (target segment).
+#                 println("Target segment reached. Stopping vehicle.")
+#                 serialize(socket, (0.0, 0.0, true))
+#                 break
+#             end
+#         end
+#         # Determine the desired steering and target velocity.
+#         steering_angle = 0.0
+#         target_vel = 7.0  # A default speed—you may choose to vary this.
+#         # If the current segment is straight, check if the next segment (if available) is curved.
+#         if !is_curved(current_seg)
+#             if current_index < length(route)
+#                 next_seg = road_map[route[current_index + 1]]
+#                 if is_curved(next_seg)
+#                     # Compute lookahead point as, for example, the midpoint of the pt_b endpoints
+#                     # of the first two lane boundaries of the curved segment.
+#                     lb1 = next_seg.lane_boundaries[1]
+#                     lb2 = next_seg.lane_boundaries[2]
+#                     lookahead_point = 0.5 * (lb1.pt_b .+ lb2.pt_b)
+#                     desired_heading = atan(lookahead_point[2] - vehicle_pos[2],
+#                                            lookahead_point[1] - vehicle_pos[1])
+#                     steering_angle = desired_heading - vehicle_heading
+#                 else
+#                     steering_angle = 0.0
+#                 end
+#             else
+#                 # No next segment, so drive straight.
+#                 steering_angle = 0.0
+#             end
+#         else
+#             # For curved segments, you may use a more sophisticated controller.
+#             # For example, use your motion planner as a fallback:
+#             (lookahead_point, steering_angle) = SkeletonsAVStack.MotionPlanning.plan_and_control(
+#                                                     road_map, route, vehicle_pos, vehicle_heading;
+#                                                     lookahead_distance=0.5)
+#         end
+        
+#         # (Optional) Add any perception-based overrides here (for obstacles, stop signs, etc.)
+#         # For example, see your previous code that might set target_vel = 0.0 if an obstacle is detected.
+        
+#         println("Vehicle pos: ", vehicle_pos, " | Current seg: ", current_seg_id,
+#                 " | Route index: ", current_index, " | Steering angle: ", steering_angle,
+#                 " | Target vel: ", target_vel)
+        
+#         # Package and send the command.
+#         cmd = (steering_angle, target_vel, true)
+#         serialize(socket, cmd)
+#         sleep(0.01)  # adjust loop rate as needed
+#     end
+# end
+
+# THIS IS THE SUCCESSFUL ONE
 function decision_making(localization_state_channel, perception_state_channel, 
-                         target_segment_channel, shutdown_channel, 
-                         road_map::Dict{Int,VehicleSim.RoadSegment}, socket)
-    # --- Initial Routing (compute once) ---
-    # Wait a short time to get an initial state measurement.
+                        target_segment_channel, shutdown_channel, 
+                        road_map::Dict{Int,VehicleSim.RoadSegment}, socket)
+    # --- Initial Routing ---
     while !isready(localization_state_channel)
         sleep(0.01)
     end
-    initial_state = take!(localization_state_channel)
-    vehicle_pos = initial_state[1:2]
-    vehicle_heading = VehicleSim.extract_yaw_from_quaternion(initial_state[4:7])
+    initial_loc = take!(localization_state_channel)
+    vehicle_pos = initial_loc[1:2]
+    vehicle_heading = VehicleSim.extract_yaw_from_quaternion(initial_loc[4:7])
     
-    # Get the target segment from its channel.
     target_seg_id = fetch(target_segment_channel)
-    # Find the starting segment (for example, using your find_nearest_segment helper).
     start_seg_id = find_nearest_segment(vehicle_pos, road_map)
-    
-    # Compute the route once from the starting segment to the target.
     route = SkeletonsAVStack.Routing.compute_route(road_map, start_seg_id, target_seg_id)
     if isempty(route)
-        println("No valid route found from segment $start_seg_id to $target_seg_id. Aborting route execution.")
+        println("No valid route found from segment $start_seg_id to $target_seg_id.")
         return
     end
     println("Computed route: ", route)
-    # Set index to the current active segment in the route.
     current_index = 1
-
-    # --- Main Loop: Follow the Precomputed Route ---
+    current_seg = road_map[route[current_index]]
+    
+    # --- Control Parameters ---
+    default_speed = 5.0  # 降低默认速度以获得更好的控制
+    lookahead_distance = 8.0  # 根据速度调整前瞻距离
+    k_p = 0.8  # 转向比例系数
+    max_steering = π/4  # 最大转向角度限制
+    
+    # --- Main Loop ---
     while true
         if isready(shutdown_channel) && fetch(shutdown_channel)
             break
         end
-
-        # Get the latest localization state.
+        
+        # Get latest state
         while !isready(localization_state_channel)
             sleep(0.001)
         end
         latest_loc = take!(localization_state_channel)
         vehicle_pos = latest_loc[1:2]
         vehicle_heading = VehicleSim.extract_yaw_from_quaternion(latest_loc[4:7])
-        # Determine the current segment from the precomputed route.
-        current_seg_id = route[current_index]
-        current_seg = road_map[current_seg_id]
-        # Check if the vehicle has reached the target of this segment.
-        # (Assumes your reached_target(pos, vel, seg) function returns true if the vehicle is
-        #  within a pre-defined threshold of the segment’s end.)
-        seg_id = find_nearest_segment(vehicle_pos, road_map)
-        if  seg_id !== nothing
-            println("Segment $seg_id reached.")
-            # If there is a next segment, advance the route index.
-            if  seg_id == route[current_index+1]
-                current_index += 1
-                current_seg_id = route[current_index]
-                current_seg = road_map[current_seg_id]
-            elseif current_index == length(route)
-                # Reached the end of the route (target segment).
-                println("Target segment reached. Stopping vehicle.")
-                serialize(socket, (0.0, 0.0, true))
+
+
+        # 2) Perception‐based obstacle check
+        latest_perc = Perception.TrackedObject[]
+        while isready(perception_state_channel)
+            latest_perc = take!(perception_state_channel)
+        end
+
+        blocked = false
+        for obj in latest_perc
+            # obj.position is [x_lateral, y_vertical?, z_forward] in camera frame
+            x_lat, _, z_fwd = obj.position
+            println("  Detected obj=$(obj.id): X=$(round(x_lat,1)) m  Z=$(round(z_fwd,1)) m")
+            if z_fwd > 0 && abs(x_lat) <= LATERAL_THRESH && z_fwd <= FORWARD_THRESH
+                blocked = true
                 break
             end
         end
-        # Determine the desired steering and target velocity.
-        steering_angle = 0.0
-        target_vel = 7.0  # A default speed—you may choose to vary this.
-        # If the current segment is straight, check if the next segment (if available) is curved.
-        if !is_curved(current_seg)
-            if current_index < length(route)
-                next_seg = road_map[route[current_index + 1]]
-                if is_curved(next_seg)
-                    # Compute lookahead point as, for example, the midpoint of the pt_b endpoints
-                    # of the first two lane boundaries of the curved segment.
-                    lb1 = next_seg.lane_boundaries[1]
-                    lb2 = next_seg.lane_boundaries[2]
-                    lookahead_point = 0.5 * (lb1.pt_b .+ lb2.pt_b)
-                    desired_heading = atan(lookahead_point[2] - vehicle_pos[2],
-                                           lookahead_point[1] - vehicle_pos[1])
-                    steering_angle = desired_heading - vehicle_heading
-                else
-                    steering_angle = 0.0
-                end
-            else
-                # No next segment, so drive straight.
-                steering_angle = 0.0
-            end
-        else
-            # For curved segments, you may use a more sophisticated controller.
-            # For example, use your motion planner as a fallback:
-            (lookahead_point, steering_angle) = SkeletonsAVStack.MotionPlanning.plan_and_control(
-                                                    road_map, route, vehicle_pos, vehicle_heading;
-                                                    lookahead_distance=0.5)
+
+        if blocked
+            println("Decision-making: obstacle detected ahead (perception) → stopping.")
+            serialize(socket, (0.0, 0.0, true))
+            sleep(0.1)
+            continue
         end
         
-        # (Optional) Add any perception-based overrides here (for obstacles, stop signs, etc.)
-        # For example, see your previous code that might set target_vel = 0.0 if an obstacle is detected.
+        current_seg_id = route[current_index]
+        current_seg = road_map[current_seg_id]
         
-        println("Vehicle pos: ", vehicle_pos, " | Current seg: ", current_seg_id,
-                " | Route index: ", current_index, " | Steering angle: ", steering_angle,
-                " | Target vel: ", target_vel)
-        
-        # Package and send the command.
-        cmd = (steering_angle, target_vel, true)
-        serialize(socket, cmd)
-        sleep(0.01)  # adjust loop rate as needed
+        if current_index < length(route)
+            # # 改进的路径点选择逻辑
+            # lb1 = current_seg.lane_boundaries[1]
+            # lb2 = current_seg.lane_boundaries[2]
+            
+            # # 计算路径中心线
+            # path_start = 0.5 .* (lb1.pt_a .+ lb2.pt_a)
+            # path_end = 0.5 .* (lb1.pt_b .+ lb2.pt_b)
+            
+            # # 计算车辆到路径的垂直投影点
+            # vehicle_to_path = path_end - path_start
+            # path_length = norm(vehicle_to_path)
+            # vehicle_to_start = vehicle_pos - path_start
+            
+            # # 计算投影比例
+            # t = clamp(dot(vehicle_to_start, vehicle_to_path) / path_length^2, 0.0, 1.0)
+            
+            # # 前瞻点计算
+            # lookahead_t = min(t + lookahead_distance/path_length, 1.0)
+            # lookahead_point = lerp.(path_start, path_end, lookahead_t)
+            
+            lb1_end = collect(current_seg.lane_boundaries[1].pt_b)[1:2]
+            lb2_end = collect(current_seg.lane_boundaries[2].pt_b)[1:2]
+            lookahead_point = 0.5 .* (lb1_end .+ lb2_end)
+            # 改进的转向控制
+            desired_heading = atan(lookahead_point[2] - vehicle_pos[2], 
+                                  lookahead_point[1] - vehicle_pos[1])
+            heading_error = angle_diff(desired_heading, vehicle_heading)
+            
+            # 考虑路径曲率
+            if is_curved(current_seg)
+                curvature = current_seg.lane_boundaries[1].curvature
+                curvature_term = 0.5 * curvature * default_speed
+            else
+                curvature_term = 0.0
+            end
+            
+            steering_angle = k_p * heading_error + curvature_term
+            steering_angle = clamp(steering_angle, -max_steering, max_steering)
+            
+            # 自适应速度控制
+            dist_to_end = segment_end_distance(current_seg, vehicle_pos)
+            speed_factor = min(1.0, dist_to_end / 10.0)  # 接近终点时减速
+            target_vel = default_speed * speed_factor
+            
+            # 处理停止标志
+            if 5 < dist_to_end < 15 && current_seg.lane_types[1] == VehicleSim.stop_sign
+                println("Approaching stop sign")
+                cmd = (0.0, 0.0, true)
+                serialize(socket, cmd)
+                sleep(3.0)
+                current_index += 1
+                continue
+            end
+            
+            # 检查是否需要切换到下一个segment
+            if dist_to_end < 10.0
+                current_index += 1
+                println("Transitioning to segment ", route[current_index])
+                continue
+            end
+            
+            cmd = (steering_angle, target_vel, true)
+            serialize(socket, cmd)
+            
+        else
+            # 停车逻辑保持不变
+            A = collect(current_seg.lane_boundaries[2].pt_a)[1:2]
+            B = collect(current_seg.lane_boundaries[2].pt_b)[1:2]
+            C = collect(current_seg.lane_boundaries[3].pt_a)[1:2]
+            D = collect(current_seg.lane_boundaries[3].pt_b)[1:2]
+            center = 0.25 .* (A .+ B .+ C .+ D)
+            dist_to_center = norm(vehicle_pos - center)
+            
+            if dist_to_center < 5
+                println("Parking complete — waiting for new target…")
+                serialize(socket, (0.0, 0.0, true))
+                while true
+                    if isready(target_segment_channel)
+                        new_t = take!(target_segment_channel)
+                        put!(target_segment_channel, new_t)
+                        if new_t != target_seg_id
+                            println(" Got new target $new_t — replanning route")
+                            start_seg_id = target_seg_id
+                            target_seg_id = new_t
+                            route = SkeletonsAVStack.Routing.compute_route(road_map, start_seg_id, target_seg_id)
+                            current_index = 1
+                            println("New route: ", route)
+                            break    # exit this wait‐loop and resume driving
+                        end
+                    end
+                    sleep(0.1)
+                end
+            else
+                desired_heading = atan(center[2] - vehicle_pos[2], center[1] - vehicle_pos[1])
+                steering_angle = angle_diff(desired_heading, vehicle_heading)
+                target_vel = default_speed * min(1.0, dist_to_center / 5.0)
+                cmd = (steering_angle, target_vel, true)
+                serialize(socket, cmd)
+            end
+        end
     end
 end
+
+# Updated Perception Function
+function perception(cam_meas_channel,
+                    perception_state_channel,
+                    shutdown_channel)
+    while true
+        # Shutdown check
+        if isready(shutdown_channel) && fetch(shutdown_channel)
+            println("Perception: shutting down.")
+            break
+        end
+
+        # 1) Drain all camera measurements
+        fresh = CameraMeasurement[]
+        while isready(cam_meas_channel)
+            push!(fresh, take!(cam_meas_channel))
+        end
+
+        # If no new frames, wait for next
+        if isempty(fresh)
+            sleep(0.05)
+            continue
+        end
+
+        # 2) Log each frame and its bounding boxes
+        for cam in fresh
+            @info "Perception: camera=$(cam.camera_id) | boxes=$(length(cam.bounding_boxes))"
+        end
+
+        # 3) Process and accumulate tracked objects
+        all_tracked = SkeletonsAVStack.Perception.TrackedObject[]
+        for cam in fresh
+            tracked = SkeletonsAVStack.Perception.process_camera_measurement(cam)
+            append!(all_tracked, tracked)
+        end
+
+        # 4) Publish the new perception state (overwrite old)
+        if !isempty(perception_state_channel)
+            take!(perception_state_channel)
+        end
+        put!(perception_state_channel, all_tracked)
+
+        # 5) Debug print
+        if isempty(all_tracked)
+            println("Perception: No objects detected.")
+        else
+            println("Perception: Detected objects:")
+            for obj in all_tracked
+                println("  ID=$(obj.id) | pos=$(obj.position) | bbox=$(obj.bbox)")
+            end
+        end
+
+        sleep(0.05)  # Loop rate
+    end
+end
+
+# Updated Decision-Making with Perception-Based Obstacle Stop/Resume
+# function decision_making(localization_state_channel,
+#                          perception_state_channel,
+#                          target_segment_channel,
+#                          shutdown_channel,
+#                          road_map,
+#                          socket)
+
+#     # --- Initial Routing (unchanged) ---
+#     while !isready(localization_state_channel)
+#         sleep(0.01)
+#     end
+#     initial_loc = take!(localization_state_channel)
+#     vehicle_pos = initial_loc[1:2]
+#     vehicle_heading = VehicleSim.extract_yaw_from_quaternion(initial_loc[4:7])
+
+#     target_seg_id = fetch(target_segment_channel)
+#     start_seg_id = find_nearest_segment(vehicle_pos, road_map)
+#     route = SkeletonsAVStack.Routing.compute_route(road_map, start_seg_id, target_seg_id)
+#     if isempty(route)
+#         println("No valid route found from segment $start_seg_id to $target_seg_id.")
+#         return
+#     end
+#     println("Computed route: ", route)
+#     current_index = 1
+
+#     # --- Control Parameters ---
+#     DEFAULT_SPEED = 5.0
+#     LATERAL_THRESH = 1.5
+#     FORWARD_THRESH = 10.0
+
+#     # --- Main Loop ---
+#     while true
+#         # Shutdown check
+#         if isready(shutdown_channel) && fetch(shutdown_channel)
+#             println("Decision-making: shutting down.")
+#             break
+#         end
+
+#         # 1) Get latest localization
+#         while !isready(localization_state_channel)
+#             sleep(0.001)
+#         end
+#         latest_loc = take!(localization_state_channel)
+#         vehicle_pos = latest_loc[1:2]
+#         vehicle_heading = VehicleSim.extract_yaw_from_quaternion(latest_loc[4:7])
+
+#         # 2) Perception‐based obstacle check
+#         latest_perc = Perception.TrackedObject[]
+#         while isready(perception_state_channel)
+#             latest_perc = take!(perception_state_channel)
+#         end
+
+#         blocked = false
+#         for obj in latest_perc
+#             # obj.position is [x_lateral, y_vertical?, z_forward] in camera frame
+#             x_lat, _, z_fwd = obj.position
+#             if z_fwd > 0 && abs(x_lat) <= LATERAL_THRESH && z_fwd <= FORWARD_THRESH
+#                 blocked = true
+#                 break
+#             end
+#         end
+
+#         if blocked
+#             println("Decision-making: obstacle detected ahead (perception) → stopping.")
+#             serialize(socket, (0.0, 0.0, true))
+#             sleep(0.1)
+#             continue
+#         end
+
+#         # 3) Segment‐following (unchanged)
+#         current_seg_id = route[current_index]
+#         current_seg = road_map[current_seg_id]
+
+#         if current_index < length(route)
+#             lb1_end = collect(current_seg.lane_boundaries[1].pt_b)[1:2]
+#             lb2_end = collect(current_seg.lane_boundaries[2].pt_b)[1:2]
+#             lookahead = 0.5 .* (lb1_end .+ lb2_end)
+#             desired_heading = atan(lookahead[2] - vehicle_pos[2], lookahead[1] - vehicle_pos[1])
+#             steering = clamp(angle_diff(desired_heading, vehicle_heading), -π/4, π/4)
+
+#             dist_end = segment_end_distance(current_seg, vehicle_pos)
+#             speed = DEFAULT_SPEED * min(1.0, dist_end/10.0)
+
+#             serialize(socket, (steering, speed, true))
+
+#             if dist_end < 5.0
+#                 current_index += 1
+#                 println("Transitioning to segment ", route[current_index])
+#             end
+#         else
+#             # Parking at target (unchanged)
+#             A = collect(current_seg.lane_boundaries[2].pt_a)[1:2]
+#             B = collect(current_seg.lane_boundaries[2].pt_b)[1:2]
+#             C = collect(current_seg.lane_boundaries[3].pt_a)[1:2]
+#             D = collect(current_seg.lane_boundaries[3].pt_b)[1:2]
+#             center = 0.25 .* (A .+ B .+ C .+ D)
+#             dist_center = norm(vehicle_pos - center)
+#             if dist_center < 0.5
+#                 println("Decision-making: parking complete.")
+#                 serialize(socket, (0.0, 0.0, true))
+#                 break
+#             else
+#                 desired_heading = atan(center[2] - vehicle_pos[2], center[1] - vehicle_pos[1])
+#                 steer = angle_diff(desired_heading, vehicle_heading)
+#                 speed = DEFAULT_SPEED * min(1.0, dist_center/5.0)
+#                 serialize(socket, (steer, speed, true))
+#             end
+#         end
+
+#         sleep(0.01)
+#     end
+# end
 
 
 
@@ -974,6 +1511,7 @@ function my_client(host::IPAddr=IPv4(0), port=4444; use_gt=false)
     # perception_state_channel = Channel{MyPerceptionType}(1)
     perception_state_channel = Channel{Vector{Float64}}(1)
     target_segment_channel = Channel{Int}(1)
+    ego_vehicle_id_channel = Channel{Int}(1)
     shutdown_channel = Channel{Bool}(1)
     put!(shutdown_channel, false)
 
@@ -981,6 +1519,7 @@ function my_client(host::IPAddr=IPv4(0), port=4444; use_gt=false)
     ego_vehicle_id = 0 # (not a valid id, will be overwritten by message. This is used for discerning ground-truth messages)
 
     put!(target_segment_channel, target_map_segment)
+    put!(ego_vehicle_id_channel, ego_vehicle_id)
 
     errormonitor(@async while true
         # This while loop reads to the end of the socket stream (makes sure you
@@ -1004,13 +1543,20 @@ function my_client(host::IPAddr=IPv4(0), port=4444; use_gt=false)
             take!(target_segment_channel)
             put!(target_segment_channel, target_map_segment)
         end
-        ego_vehicle_id = measurement_msg.vehicle_id
+        if fetch(ego_vehicle_id_channel) == 0
+            ego_vehicle_id = measurement_msg.vehicle_id
+            take!(ego_vehicle_id_channel)
+            put!(ego_vehicle_id_channel, ego_vehicle_id)
+        else
+            ego_vehicle_id = fetch(ego_vehicle_id_channel)
+        end
+        println("I am Vehicle No.", ego_vehicle_id)
         for meas in measurement_msg.measurements
-            if meas isa GPSMeasurement
+            if meas isa GPSMeasurement && measurement_msg.vehicle_id == ego_vehicle_id
                 !isfull(gps_channel) && put!(gps_channel, meas)
-            elseif meas isa IMUMeasurement
+            elseif meas isa IMUMeasurement && measurement_msg.vehicle_id == ego_vehicle_id
                 !isfull(imu_channel) && put!(imu_channel, meas)
-            elseif meas isa CameraMeasurement
+            elseif meas isa CameraMeasurement && measurement_msg.vehicle_id == ego_vehicle_id
                 !isfull(cam_channel) && put!(cam_channel, meas)
             elseif meas isa GroundTruthMeasurement
                 !isfull(gt_channel) && put!(gt_channel, meas)
@@ -1021,7 +1567,7 @@ function my_client(host::IPAddr=IPv4(0), port=4444; use_gt=false)
     if use_gt
         @async process_gt(gt_channel,
                       shutdown_channel, target_segment_channel, 
-                      perception_state_channel, map_segments, socket)
+                      map_segments, socket, ego_vehicle_id_channel)
     else
         @async localize(gps_channel, 
                     imu_channel, 
@@ -1031,16 +1577,14 @@ function my_client(host::IPAddr=IPv4(0), port=4444; use_gt=false)
         @async perception(cam_channel,
                       perception_state_channel, 
                       shutdown_channel)
+
+        @async decision_making(localization_state_channel, 
+            perception_state_channel, 
+            target_segment_channel, 
+            shutdown_channel,
+            map_segments, 
+            socket)
     end
-
-
-
-    @async decision_making(localization_state_channel, 
-                           perception_state_channel, 
-                           target_segment_channel, 
-                           shutdown_channel,
-                           map_segments, 
-                           socket)
 end
 
 function shutdown_listener(shutdown_channel)
