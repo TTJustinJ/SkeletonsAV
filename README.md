@@ -23,7 +23,7 @@ Then for groundtruth mode:
 ```
 julia +1.9.3 --project --threads=auto
 using Revise, Sockets, SkeletonsAVStack
-SkeletonsAVStack.my_client(ip"your_IPADRESSS"; use_gt = true) #
+SkeletonsAVStack.my_client(ip"your_IPADRESSS"; use_gt = true) # change IP address to yours
 ```
 
 For off mode, just set use_gt = false:
