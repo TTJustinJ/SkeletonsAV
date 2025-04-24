@@ -18,8 +18,8 @@ function test_motion_planning()
     println("Route computed: ", route)
     
     # Let’s assume the vehicle is at a certain starting position and heading.
-    vehicle_pos = [0.0, 0.0]  # Example starting coordinate.
-    vehicle_heading = 0.0     # Facing east, for instance.
+    vehicle_pos = [0.0, 0.0]  # Starting at the origin
+    vehicle_heading = 0.0     # Facing east
     
     # Compute the lookahead point and steering command.
     lookahead_point, steering_cmd = plan_and_control(map, route, vehicle_pos, vehicle_heading; lookahead_distance=5.0)

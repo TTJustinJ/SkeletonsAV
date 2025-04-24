@@ -7,18 +7,13 @@ using VehicleSim
 # Create a city map using VehicleSim's city_map() function.
 city_map = VehicleSim.city_map()
 
-# for (id, seg) in city_map
-#     if VehicleSim.contains_lane_type(seg, VehicleSim.loading_zone)
-#         println("Segment ", id, " is a loading zone")
-#     end
-# end
 
 # Print out available segment IDs.
 segments = sort(collect(keys(city_map)))
 println("City map segments: ", segments)
 
 # Choose a start segment and a goal segment.
-# For testing purposes, we choose the first and last segments.
+# For testing purposes, we randomly selected two segments
 start_seg = 78
 goal_seg = 56
 println("Using start segment: ", start_seg, " and goal segment: ", goal_seg)

@@ -42,7 +42,6 @@ function process_camera_measurement(cam_meas::VehicleSim.CameraMeasurement)
     
     # For each bounding box.
     for (i, bbox) in enumerate(cam_meas.bounding_boxes)
-        # bbox is assumed to be an SVector{4, Int} with [top, left, bottom, right].
         top, left, bottom, right = bbox
         # Compute center pixel.
         cx = (left + right) / 2
@@ -58,10 +57,6 @@ function process_camera_measurement(cam_meas::VehicleSim.CameraMeasurement)
         depth = VEHICLE_HEIGHT * focal_length / (pixel_height * pixel_len)
         
         # Compute candidate 3D point in camera frame.
-        # For the pinhole camera:
-        #   X_cam = (u - center_x) * depth * pixel_len / focal_length
-        #   Y_cam = (v - center_y) * depth * pixel_len / focal_length
-        #   Z_cam = depth
         X_cam = (cx - image_center[1]) * depth * pixel_len / focal_length
         Y_cam = (cy - image_center[2]) * depth * pixel_len / focal_length
         Z_cam = depth

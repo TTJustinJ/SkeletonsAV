@@ -19,8 +19,6 @@ const shutdown_channel = Channel{Bool}(1)
 
 # Define a helper function to simulate a camera measurement.
 function simulate_cam_measurement()
-    # For example, assume an image of size 640x480 with camera 1,
-    # focal length 0.64, and pixel length 0.001.
     # Create a dummy bounding box:
     #   [top, left, bottom, right].
     # For instance, a detection roughly in the center:
@@ -29,8 +27,6 @@ function simulate_cam_measurement()
 end
 
 # Launch the perception routine as an asynchronous task.
-# (It will read from cam_meas_channel and localization_state_channel, process the measurements,
-# and publish the detected objects to perception_state_channel.)
 perception_task = @async SkeletonsAVStack.Perception.perception(cam_meas_channel, perception_state_channel, shutdown_channel)
 
 # Simulate sending a few camera measurements.
